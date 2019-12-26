@@ -2,6 +2,7 @@ use std::sync::mpsc::{sync_channel, SyncSender, Receiver};
 use std::thread;
 use mosquitto_client;
 use serde_json;
+use std::fmt::Debug;
 
 fn read_mqtt_feed(sender: &SyncSender<String>) -> Result<(), mosquitto_client::Error> {
     let m = mosquitto_client::Mosquitto::new("hsl");
@@ -31,16 +32,25 @@ fn convert_to_json(receiver: &Receiver<String>, sender: &SyncSender<serde_json::
     }
 }
 
-fn print_items(receiver: &Receiver<serde_json::Value>) {
+fn apply_fn_to_chan<T1, T2>(f: impl Fn(T1) -> T2, receiver: &Receiver<T1>, sender: &SyncSender<T2>) {
     loop {
         let next = receiver.recv().unwrap();
-        println!("{}", next["VP"]) // VP = vehicle position data, only event in this payload
+        let new = f(next);
+        sender.send(new).unwrap();
+    }
+}
+
+fn print_items<T: Debug>(receiver: &Receiver<T>) {
+    loop {
+        let next = receiver.recv().unwrap();
+        println!("{:?}", next)
     }
 }
 
 pub fn run() {
     let (raw_data_sender, raw_data_receiver) = sync_channel(100);
     let (json_data_sender, json_data_receiver) = sync_channel(100);
+    let (transformer_sender, transformer_receiver) = sync_channel(100);
 
     thread::spawn(move|| {
         read_mqtt_feed(&raw_data_sender).unwrap();
@@ -50,5 +60,9 @@ pub fn run() {
         convert_to_json(&raw_data_receiver, &json_data_sender);
     });
 
-    print_items(&json_data_receiver);
+    thread::spawn(move|| {
+        apply_fn_to_chan(|x| x["VP"].clone(), &json_data_receiver, &transformer_sender);
+    });
+
+    print_items(&transformer_receiver);
 }
