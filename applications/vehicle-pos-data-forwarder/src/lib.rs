@@ -4,6 +4,36 @@ use mosquitto_client;
 use serde_json;
 use std::fmt::Debug;
 
+#[test]
+fn test_apply_fn_to_chan() {
+    let (sender, receiver) = sync_channel(10);
+    let (f_sender, f_receiver) = sync_channel(10);
+
+    thread::spawn(move|| {
+        apply_fn_to_chan(|x| x + 2, &receiver, &f_sender);
+    });
+
+    let val = 3;
+    sender.send(val).unwrap();
+    assert_eq!(5, f_receiver.recv().unwrap())
+}
+
+#[test]
+fn test_covert_to_json() {
+    let (sender, receiver) = sync_channel(10);
+    let (f_sender, f_receiver) = sync_channel(10);
+
+    thread::spawn(move|| {
+        convert_to_json(&receiver, &f_sender);
+    });
+
+    let json_str = String::from("{\"name\":\"Tomi\",\"age\":31,\"class\":\"rust basics\"}");
+    sender.send(json_str).unwrap();
+    let json_value = f_receiver.recv().unwrap();
+    assert_eq!("Tomi", json_value["name"].as_str().unwrap());
+    assert_eq!(31, json_value["age"].as_u64().unwrap());
+}
+
 fn read_mqtt_feed(sender: &SyncSender<String>) -> Result<(), mosquitto_client::Error> {
     let m = mosquitto_client::Mosquitto::new("hsl");
 
