@@ -1,5 +1,5 @@
 use std::sync::mpsc::{sync_channel, SyncSender, Receiver};
-use std::thread;
+use std::{thread, time};
 use mosquitto_client;
 use serde_json;
 use std::fmt::Debug;
@@ -34,14 +34,59 @@ fn test_covert_to_json() {
     assert_eq!(31, json_value["age"].as_u64().unwrap());
 }
 
-fn read_mqtt_feed(sender: &SyncSender<String>) -> Result<(), mosquitto_client::Error> {
+#[test]
+fn test_mqtt_reader() {
+    use uuid::Uuid;
+
+    let mqtt_host = String::from("test.mosquitto.org");
+    let mqtt_port = 1883;
+    let mqtt_topic = format!("/tomi/{}", Uuid::new_v4());
+    let config = Config{mqtt_host, mqtt_port, mqtt_topic};
+
+    let (sender, receiver) = sync_channel(10);
+    let read_config = config.clone();
+    thread::spawn(move|| {
+        read_mqtt_feed(&sender, read_config).expect("Testing mqtt read failed");
+    });
+
+    let m = mosquitto_client::Mosquitto::new("test");
+    m.connect("test.mosquitto.org", 1883).expect("Cant connect to test.mosquitto.org");
+
+    thread::spawn(move || {
+        let timeout = time::Duration::from_millis(500);
+        thread::sleep(timeout);
+
+        let msg = String::from("Hello from mosquitto!");
+        m.publish(config.mqtt_topic.as_str(), msg.as_bytes(), 1, false)
+            .expect("First message send failed!");
+
+        thread::sleep(timeout);
+        let msg = String::from("Hello Again!");
+        m.publish(config.mqtt_topic.as_str(), msg.as_bytes(), 1, false)
+            .expect("Second message send failed!");;
+        
+        m.disconnect().unwrap();
+    });
+
+    assert_eq!("Hello from mosquitto!", receiver.recv().unwrap());
+    assert_eq!("Hello Again!", receiver.recv().unwrap());
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub mqtt_host: String,
+    pub mqtt_port: u32,
+    pub mqtt_topic: String,
+}
+
+fn read_mqtt_feed(sender: &SyncSender<String>, config: Config) -> Result<(), mosquitto_client::Error> {
     let m = mosquitto_client::Mosquitto::new("hsl");
 
     //tls port 8883 not working, how to set cert-file correctly?
     //m.tls_set("/etc/ssl/certs/", "/etc/ssl/certs/", "/etc/ssl/certs/", None);
-    m.connect("mqtt.hsl.fi", 1883)?;
+    m.connect(config.mqtt_host.as_str(), config.mqtt_port)?;
 
-    let vehicle_postions = m.subscribe("/hfp/v2/journey/ongoing/vp/+/+/+/2543/1/#", 0)?;
+    let vehicle_postions = m.subscribe(config.mqtt_topic.as_str(), 0)?;
 
     let mut mc = m.callbacks(());
     mc.on_message(|_,msg| {
@@ -77,13 +122,13 @@ fn print_items<T: Debug>(receiver: &Receiver<T>) {
     }
 }
 
-pub fn run() {
+pub fn run(config: Config) {
     let (raw_data_sender, raw_data_receiver) = sync_channel(100);
     let (json_data_sender, json_data_receiver) = sync_channel(100);
     let (transformer_sender, transformer_receiver) = sync_channel(100);
 
     thread::spawn(move|| {
-        read_mqtt_feed(&raw_data_sender).unwrap();
+        read_mqtt_feed(&raw_data_sender, config).unwrap();
     });
 
     thread::spawn(move|| {
