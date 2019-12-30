@@ -4,7 +4,9 @@ use mosquitto_client;
 use serde_json;
 use std::fmt::Debug;
 use std::time::Duration;
-use kafka::producer::{Producer, Record, RequiredAcks};
+use rdkafka::config::ClientConfig;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::get_rdkafka_version;
 
 #[test]
 fn test_apply_fn_to_chan() {
@@ -129,20 +131,26 @@ fn print_items<T: Debug>(receiver: &Receiver<T>) {
 }
 
 pub fn kafka_sender(receiver: &Receiver<serde_json::Value>, config: Config) {
-    let mut kafka_producer  =
-        Producer::from_hosts(vec!(config.kafka_host.to_owned()))
-            .with_ack_timeout(Duration::from_secs(1))
-            .with_required_acks(RequiredAcks::One)
-            .create()
-            .expect("Failed to create Kafka producer");
+
+    let kafka_producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &config.kafka_host)
+        .set("produce.offset.report", "true")
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("Producer creation error");
 
     loop {
         let next = receiver.recv().unwrap();
+        let key = format!("{}-{}", next["route"], next["tst"]);
         let next= next.to_string();
 
         kafka_producer.send(
-            &Record::from_value(&config.kafka_topic,  next.as_bytes())
-        ).expect("Failed to send a message to kafka");
+            FutureRecord::to(config.kafka_topic.as_str())
+                .payload(next.as_bytes())
+                .key(key.as_str()),
+            -1
+        );
+        // TODO How to correctly handle future results?
     }
 }
 
