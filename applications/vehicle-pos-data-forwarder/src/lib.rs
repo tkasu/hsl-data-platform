@@ -3,6 +3,8 @@ use std::{thread, time};
 use mosquitto_client;
 use serde_json;
 use std::fmt::Debug;
+use std::time::Duration;
+use kafka::producer::{Producer, Record, RequiredAcks};
 
 #[test]
 fn test_apply_fn_to_chan() {
@@ -41,7 +43,9 @@ fn test_mqtt_reader() {
     let mqtt_host = String::from("test.mosquitto.org");
     let mqtt_port = 1883;
     let mqtt_topic = format!("/tomi/{}", Uuid::new_v4());
-    let config = Config{mqtt_host, mqtt_port, mqtt_topic};
+    let kafka_host = String::from("kafka_dummy_host");
+    let kafka_topic = String::from("kafka_dummy_port");
+    let config = Config{mqtt_host, mqtt_port, mqtt_topic, kafka_host, kafka_topic};
 
     let (sender, receiver) = sync_channel(10);
     let read_config = config.clone();
@@ -77,6 +81,8 @@ pub struct Config {
     pub mqtt_host: String,
     pub mqtt_port: u32,
     pub mqtt_topic: String,
+    pub kafka_host: String,
+    pub kafka_topic: String,
 }
 
 fn read_mqtt_feed(sender: &SyncSender<String>, config: Config) -> Result<(), mosquitto_client::Error> {
@@ -122,13 +128,32 @@ fn print_items<T: Debug>(receiver: &Receiver<T>) {
     }
 }
 
+pub fn kafka_sender(receiver: &Receiver<serde_json::Value>, config: Config) {
+    let mut kafka_producer  =
+        Producer::from_hosts(vec!(config.kafka_host.to_owned()))
+            .with_ack_timeout(Duration::from_secs(1))
+            .with_required_acks(RequiredAcks::One)
+            .create()
+            .expect("Failed to create Kafka producer");
+
+    loop {
+        let next = receiver.recv().unwrap();
+        let next= next.to_string();
+
+        kafka_producer.send(
+            &Record::from_value(&config.kafka_topic,  next.as_bytes())
+        ).expect("Failed to send a message to kafka");
+    }
+}
+
 pub fn run(config: Config) {
     let (raw_data_sender, raw_data_receiver) = sync_channel(100);
     let (json_data_sender, json_data_receiver) = sync_channel(100);
     let (transformer_sender, transformer_receiver) = sync_channel(100);
 
+    let mqtt_config = config.clone();
     thread::spawn(move|| {
-        read_mqtt_feed(&raw_data_sender, config).unwrap();
+        read_mqtt_feed(&raw_data_sender, mqtt_config).unwrap();
     });
 
     thread::spawn(move|| {
@@ -139,5 +164,6 @@ pub fn run(config: Config) {
         apply_fn_to_chan(|x| x["VP"].clone(), &json_data_receiver, &transformer_sender);
     });
 
-    print_items(&transformer_receiver);
+    kafka_sender(&transformer_receiver, config)
+    //print_items(&transformer_receiver);
 }
