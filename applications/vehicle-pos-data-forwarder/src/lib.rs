@@ -1,12 +1,16 @@
 use std::sync::mpsc::{sync_channel, SyncSender, Receiver};
-use std::{thread, time};
-use mosquitto_client;
+use std::{str, thread, time};
+use rumqtt::{MqttClient, MqttOptions, QoS, ReconnectOptions};
+use mqtt311;
 use serde_json;
 use std::fmt::Debug;
 use std::time::Duration;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::get_rdkafka_version;
+use std::error::Error;
+use std::fmt;
+use std::collections::HashSet;
 
 #[test]
 fn test_apply_fn_to_chan() {
@@ -40,6 +44,7 @@ fn test_covert_to_json() {
 
 #[test]
 fn test_mqtt_reader() {
+    // TODO This test is unstable, messages to test.mosquitto.org are not going through reliably
     use uuid::Uuid;
 
     let mqtt_host = String::from("test.mosquitto.org");
@@ -52,30 +57,45 @@ fn test_mqtt_reader() {
     let (sender, receiver) = sync_channel(10);
     let read_config = config.clone();
     thread::spawn(move|| {
-        read_mqtt_feed(&sender, read_config).expect("Testing mqtt read failed");
+        read_mqtt_feed(&sender, read_config);
     });
 
-    let m = mosquitto_client::Mosquitto::new("test");
-    m.connect("test.mosquitto.org", 1883).expect("Cant connect to test.mosquitto.org");
+    thread::sleep(time::Duration::from_secs(5));
+
+    let reconnection_options = ReconnectOptions::Always(10);
+    let mqtt_options = MqttOptions::new("hsl", config.mqtt_host.as_str(), config.mqtt_port as u16)
+        .set_keep_alive(10)
+        .set_inflight(3)
+        .set_request_channel_capacity(3)
+        .set_reconnect_opts(reconnection_options)
+        .set_clean_session(false);
+
+    let (mut m, _) = MqttClient::start(mqtt_options).unwrap();
 
     thread::spawn(move || {
         let timeout = time::Duration::from_millis(500);
         thread::sleep(timeout);
 
         let msg = String::from("Hello from mosquitto!");
-        m.publish(config.mqtt_topic.as_str(), msg.as_bytes(), 1, false)
+        m.publish(config.mqtt_topic.as_str(), QoS::AtLeastOnce, false, msg)
             .expect("First message send failed!");
 
         thread::sleep(timeout);
         let msg = String::from("Hello Again!");
-        m.publish(config.mqtt_topic.as_str(), msg.as_bytes(), 1, false)
+        m.publish(config.mqtt_topic.as_str(), QoS::AtLeastOnce, false, msg)
             .expect("Second message send failed!");;
-        
-        m.disconnect().unwrap();
+
     });
 
-    assert_eq!("Hello from mosquitto!", receiver.recv().unwrap());
-    assert_eq!("Hello Again!", receiver.recv().unwrap());
+    let mut expected: HashSet<String> = HashSet::new();
+    expected.insert("Hello from mosquitto!".to_string());
+    expected.insert("Hello Again!".to_string());
+
+    let mut messages: HashSet<String> = HashSet::new();
+    messages.insert(receiver.recv().unwrap());
+    messages.insert(receiver.recv().unwrap());
+
+    assert_eq!(expected, messages);
 }
 
 #[derive(Debug, Clone)]
@@ -87,24 +107,48 @@ pub struct Config {
     pub kafka_topic: String,
 }
 
-fn read_mqtt_feed(sender: &SyncSender<String>, config: Config) -> Result<(), mosquitto_client::Error> {
-    let m = mosquitto_client::Mosquitto::new("hsl");
+#[derive(Debug)]
+struct MqttPayloadError(String);
 
-    //tls port 8883 not working, how to set cert-file correctly?
-    //m.tls_set("/etc/ssl/certs/", "/etc/ssl/certs/", "/etc/ssl/certs/", None);
-    m.connect(config.mqtt_host.as_str(), config.mqtt_port)?;
+impl fmt::Display for MqttPayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "There is an error: {}", self.0)
+    }
+}
 
-    let vehicle_postions = m.subscribe(config.mqtt_topic.as_str(), 0)?;
+impl Error for MqttPayloadError {}
 
-    let mut mc = m.callbacks(());
-    mc.on_message(|_,msg| {
-        if vehicle_postions.matches(&msg) {
-            let data = msg.text().to_string();
-            sender.send(data).unwrap();
+fn extract_mqtt_payload(p: mqtt311::Publish) -> Result<String, MqttPayloadError> {
+    let m = match str::from_utf8(&p.payload) {
+        Ok(m) => m,
+        Err(e) => return Result::Err(MqttPayloadError(e.to_string()))
+    };
+    Result::Ok(String::from(m))
+}
+
+fn read_mqtt_feed(sender: &SyncSender<String>, config: Config) -> () {
+    let reconnection_options = ReconnectOptions::Always(10);
+    let mqtt_options = MqttOptions::new("hsl", config.mqtt_host.as_str(), config.mqtt_port as u16)
+        .set_keep_alive(10)
+        .set_inflight(3)
+        .set_request_channel_capacity(3)
+        .set_reconnect_opts(reconnection_options)
+        .set_clean_session(false);
+
+    let (mut m, notifications) = MqttClient::start(mqtt_options).unwrap();
+
+    let vehicle_postions = m.subscribe(config.mqtt_topic.as_str(), QoS::AtLeastOnce).unwrap();
+
+    for msg in notifications {
+        match msg {
+            rumqtt::client::Notification::Publish(p) => {
+                let data = extract_mqtt_payload(p)
+                    .expect("Payload extract failed for message");
+                sender.send(data);
+            }
+            _ => println!("Skipping non Publish-message: {:?}", msg)
         }
-    });
-
-    m.loop_forever(200)
+    }
 }
 
 fn convert_to_json(receiver: &Receiver<String>, sender: &SyncSender<serde_json::Value>) {
@@ -161,7 +205,7 @@ pub fn run(config: Config) {
 
     let mqtt_config = config.clone();
     thread::spawn(move|| {
-        read_mqtt_feed(&raw_data_sender, mqtt_config).unwrap();
+        read_mqtt_feed(&raw_data_sender, mqtt_config);
     });
 
     thread::spawn(move|| {
