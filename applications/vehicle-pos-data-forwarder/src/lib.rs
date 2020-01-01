@@ -1,23 +1,22 @@
-use std::sync::mpsc::{sync_channel, SyncSender, Receiver};
-use std::{str, thread, time};
-use rumqtt::{MqttClient, MqttOptions, QoS, ReconnectOptions};
 use mqtt311;
-use serde_json;
-use std::fmt::Debug;
-use std::time::Duration;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::util::get_rdkafka_version;
+use rumqtt::{MqttClient, MqttOptions, QoS, ReconnectOptions};
+use serde_json;
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
-use std::collections::HashSet;
+use std::fmt::Debug;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::time::Duration;
+use std::{str, thread, time};
 
 #[test]
 fn test_apply_fn_to_chan() {
     let (sender, receiver) = sync_channel(10);
     let (f_sender, f_receiver) = sync_channel(10);
 
-    thread::spawn(move|| {
+    thread::spawn(move || {
         apply_fn_to_chan(|x| x + 2, &receiver, &f_sender);
     });
 
@@ -31,7 +30,7 @@ fn test_covert_to_json() {
     let (sender, receiver) = sync_channel(10);
     let (f_sender, f_receiver) = sync_channel(10);
 
-    thread::spawn(move|| {
+    thread::spawn(move || {
         convert_to_json(&receiver, &f_sender);
     });
 
@@ -52,11 +51,17 @@ fn test_mqtt_reader() {
     let mqtt_topic = format!("/tomi/{}", Uuid::new_v4());
     let kafka_host = String::from("kafka_dummy_host");
     let kafka_topic = String::from("kafka_dummy_port");
-    let config = Config{mqtt_host, mqtt_port, mqtt_topic, kafka_host, kafka_topic};
+    let config = Config {
+        mqtt_host,
+        mqtt_port,
+        mqtt_topic,
+        kafka_host,
+        kafka_topic,
+    };
 
     let (sender, receiver) = sync_channel(10);
     let read_config = config.clone();
-    thread::spawn(move|| {
+    thread::spawn(move || {
         read_mqtt_feed(&sender, read_config);
     });
 
@@ -83,8 +88,7 @@ fn test_mqtt_reader() {
         thread::sleep(timeout);
         let msg = String::from("Hello Again!");
         m.publish(config.mqtt_topic.as_str(), QoS::AtLeastOnce, false, msg)
-            .expect("Second message send failed!");;
-
+            .expect("Second message send failed!");
     });
 
     let mut expected: HashSet<String> = HashSet::new();
@@ -121,7 +125,7 @@ impl Error for MqttPayloadError {}
 fn extract_mqtt_payload(p: mqtt311::Publish) -> Result<String, MqttPayloadError> {
     let m = match str::from_utf8(&p.payload) {
         Ok(m) => m,
-        Err(e) => return Result::Err(MqttPayloadError(e.to_string()))
+        Err(e) => return Result::Err(MqttPayloadError(e.to_string())),
     };
     Result::Ok(String::from(m))
 }
@@ -137,16 +141,17 @@ fn read_mqtt_feed(sender: &SyncSender<String>, config: Config) -> () {
 
     let (mut m, notifications) = MqttClient::start(mqtt_options).unwrap();
 
-    let vehicle_postions = m.subscribe(config.mqtt_topic.as_str(), QoS::AtLeastOnce).unwrap();
+    let vehicle_postions = m
+        .subscribe(config.mqtt_topic.as_str(), QoS::AtLeastOnce)
+        .unwrap();
 
     for msg in notifications {
         match msg {
             rumqtt::client::Notification::Publish(p) => {
-                let data = extract_mqtt_payload(p)
-                    .expect("Payload extract failed for message");
-                sender.send(data);
+                let data = extract_mqtt_payload(p).expect("Payload extract failed for message");
+                sender.send(data).unwrap();
             }
-            _ => println!("Skipping non Publish-message: {:?}", msg)
+            _ => println!("Skipping non Publish-message: {:?}", msg),
         }
     }
 }
@@ -159,7 +164,11 @@ fn convert_to_json(receiver: &Receiver<String>, sender: &SyncSender<serde_json::
     }
 }
 
-fn apply_fn_to_chan<T1, T2>(f: impl Fn(T1) -> T2, receiver: &Receiver<T1>, sender: &SyncSender<T2>) {
+fn apply_fn_to_chan<T1, T2>(
+    f: impl Fn(T1) -> T2,
+    receiver: &Receiver<T1>,
+    sender: &SyncSender<T2>,
+) {
     loop {
         let next = receiver.recv().unwrap();
         let new = f(next);
@@ -175,7 +184,6 @@ fn print_items<T: Debug>(receiver: &Receiver<T>) {
 }
 
 pub fn kafka_sender(receiver: &Receiver<serde_json::Value>, config: Config) {
-
     let kafka_producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &config.kafka_host)
         .set("produce.offset.report", "true")
@@ -186,13 +194,13 @@ pub fn kafka_sender(receiver: &Receiver<serde_json::Value>, config: Config) {
     loop {
         let next = receiver.recv().unwrap();
         let key = format!("{}-{}", next["route"], next["tst"]);
-        let next= next.to_string();
+        let next = next.to_string();
 
         kafka_producer.send(
             FutureRecord::to(config.kafka_topic.as_str())
                 .payload(next.as_bytes())
                 .key(key.as_str()),
-            -1
+            -1,
         );
         // TODO How to correctly handle future results?
     }
@@ -204,16 +212,20 @@ pub fn run(config: Config) {
     let (transformer_sender, transformer_receiver) = sync_channel(100);
 
     let mqtt_config = config.clone();
-    thread::spawn(move|| {
+    thread::spawn(move || {
         read_mqtt_feed(&raw_data_sender, mqtt_config);
     });
 
-    thread::spawn(move|| {
+    thread::spawn(move || {
         convert_to_json(&raw_data_receiver, &json_data_sender);
     });
 
-    thread::spawn(move|| {
-        apply_fn_to_chan(|x| x["VP"].clone(), &json_data_receiver, &transformer_sender);
+    thread::spawn(move || {
+        apply_fn_to_chan(
+            |x| x["VP"].clone(),
+            &json_data_receiver,
+            &transformer_sender,
+        );
     });
 
     kafka_sender(&transformer_receiver, config)
