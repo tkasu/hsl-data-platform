@@ -49,14 +49,11 @@ fn test_mqtt_reader() {
     let mqtt_host = String::from("test.mosquitto.org");
     let mqtt_port = 1883;
     let mqtt_topic = format!("/tomi/{}", Uuid::new_v4());
-    let kafka_host = String::from("kafka_dummy_host");
-    let kafka_topic = String::from("kafka_dummy_port");
-    let config = Config {
+
+    let config = MqttConfig {
         mqtt_host,
         mqtt_port,
         mqtt_topic,
-        kafka_host,
-        kafka_topic,
     };
 
     let (sender, receiver) = sync_channel(10);
@@ -65,9 +62,9 @@ fn test_mqtt_reader() {
         read_mqtt_feed(&sender, read_config);
     });
 
-    thread::sleep(time::Duration::from_secs(5));
+    thread::sleep(time::Duration::from_secs(3));
 
-    let reconnection_options = ReconnectOptions::Always(10);
+    let reconnection_options = ReconnectOptions::Always(2);
     let mqtt_options = MqttOptions::new("hsl", config.mqtt_host.as_str(), config.mqtt_port as u16)
         .set_keep_alive(10)
         .set_inflight(3)
@@ -77,9 +74,8 @@ fn test_mqtt_reader() {
 
     let (mut m, _) = MqttClient::start(mqtt_options).unwrap();
 
-    thread::spawn(move || {
+    let pub_handler = thread::spawn(move || {
         let timeout = time::Duration::from_millis(500);
-        thread::sleep(timeout);
 
         let msg = String::from("Hello from mosquitto!");
         m.publish(config.mqtt_topic.as_str(), QoS::AtLeastOnce, false, msg)
@@ -89,7 +85,11 @@ fn test_mqtt_reader() {
         let msg = String::from("Hello Again!");
         m.publish(config.mqtt_topic.as_str(), QoS::AtLeastOnce, false, msg)
             .expect("Second message send failed!");
+
+        thread::sleep(time::Duration::from_secs(10));
     });
+
+    pub_handler.join().unwrap();
 
     let mut expected: HashSet<String> = HashSet::new();
     expected.insert("Hello from mosquitto!".to_string());
@@ -104,11 +104,90 @@ fn test_mqtt_reader() {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub mqtt_config: MqttConfig,
+    pub endpoint_config: EndpointConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct MqttConfig {
     pub mqtt_host: String,
     pub mqtt_port: u32,
     pub mqtt_topic: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct KafkaConfig {
     pub kafka_host: String,
     pub kafka_topic: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum EndpointConfig {
+    KafkaConfig(KafkaConfig),
+    DebugConfig,
+}
+
+impl Config {
+    pub fn new(mut args: std::env::Args) -> Result<Config, &'static str> {
+        let mqtt_host = String::from("mqtt.hsl.fi");
+        let mqtt_port = 1883;
+
+        args.next(); // skip the name of the program
+
+        let mqtt_topic = match args.next() {
+            Some(arg) => {
+                if arg == "dev" {
+                    // set default query string for development
+                    String::from("/hfp/v2/journey/ongoing/vp/+/+/+/2543/1/#")
+                } else {
+                    arg
+                }
+            }
+            None => return Err("Did not get mqtt topic string, expected mqtt topic or 'dev'"),
+        };
+
+        let endpoint_config = match args.next() {
+            Some(arg) => {
+                if arg == "debug" {
+                    EndpointConfig::DebugConfig
+                } else if arg == "kafka" {
+                    let kafka_host = match args.next() {
+                        Some(arg) => arg,
+                        None => return Err("Did not get kafka hostname"),
+                    };
+
+                    let kafka_topic = match args.next() {
+                        Some(arg) => arg,
+                        None => return Err("Did not get kafka topic"),
+                    };
+
+                    EndpointConfig::KafkaConfig(KafkaConfig {
+                        kafka_host,
+                        kafka_topic,
+                    })
+                } else {
+                    return Err("Incorrect endpoint type, expected kafka or debug");
+                }
+            }
+            None => return Err("Did not get endpoint type, expected kafka or debug"),
+        };
+
+        let next_arg = args.next();
+        if next_arg.is_some() {
+            return Err("Unexpected argument after endpoint arguments.");
+        }
+
+        let mqtt_config = MqttConfig {
+            mqtt_host,
+            mqtt_port,
+            mqtt_topic,
+        };
+
+        Ok(Config {
+            mqtt_config,
+            endpoint_config,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -130,7 +209,7 @@ fn extract_mqtt_payload(p: mqtt311::Publish) -> Result<String, MqttPayloadError>
     Result::Ok(String::from(m))
 }
 
-fn read_mqtt_feed(sender: &SyncSender<String>, config: Config) -> () {
+fn read_mqtt_feed(sender: &SyncSender<String>, config: MqttConfig) -> () {
     let reconnection_options = ReconnectOptions::Always(10);
     let mqtt_options = MqttOptions::new("hsl", config.mqtt_host.as_str(), config.mqtt_port as u16)
         .set_keep_alive(10)
@@ -183,7 +262,7 @@ fn print_items<T: Debug>(receiver: &Receiver<T>) {
     }
 }
 
-pub fn kafka_sender(receiver: &Receiver<serde_json::Value>, config: Config) {
+pub fn kafka_sender(receiver: &Receiver<serde_json::Value>, config: KafkaConfig) {
     let kafka_producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &config.kafka_host)
         .set("produce.offset.report", "true")
@@ -211,7 +290,7 @@ pub fn run(config: Config) {
     let (json_data_sender, json_data_receiver) = sync_channel(100);
     let (transformer_sender, transformer_receiver) = sync_channel(100);
 
-    let mqtt_config = config.clone();
+    let mqtt_config = config.clone().mqtt_config;
     thread::spawn(move || {
         read_mqtt_feed(&raw_data_sender, mqtt_config);
     });
@@ -228,6 +307,10 @@ pub fn run(config: Config) {
         );
     });
 
-    kafka_sender(&transformer_receiver, config)
-    //print_items(&transformer_receiver);
+    match config.endpoint_config {
+        EndpointConfig::DebugConfig => print_items(&transformer_receiver),
+        EndpointConfig::KafkaConfig(kafka_config) => {
+            kafka_sender(&transformer_receiver, kafka_config)
+        }
+    }
 }
