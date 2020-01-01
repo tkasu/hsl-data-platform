@@ -1,3 +1,4 @@
+use futures::Future;
 use mqtt311;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -275,13 +276,17 @@ pub fn kafka_sender(receiver: &Receiver<serde_json::Value>, config: KafkaConfig)
         let key = format!("{}-{}", next["route"], next["tst"]);
         let next = next.to_string();
 
-        kafka_producer.send(
+        let delivery = kafka_producer.send(
             FutureRecord::to(config.kafka_topic.as_str())
                 .payload(next.as_bytes())
                 .key(key.as_str()),
             -1,
         );
-        // TODO How to correctly handle future results?
+        print!("Sent key {} to kafka... ", key);
+        match delivery.wait().unwrap() {
+            Ok((num1, num2)) => println!("delivery ok {} {}.", num1, num2),
+            Err(e) => panic!("Delivery failed to kafka: {:?}", e),
+        };
     }
 }
 

@@ -974,6 +974,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 name = "vehicle-pos-data-forwarder"
 version = "0.1.0"
 dependencies = [
+ "futures 0.1.29 (registry+https://github.com/rust-lang/crates.io-index)",
  "mqtt311 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rdkafka 0.22.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rumqtt 0.31.0 (registry+https://github.com/rust-lang/crates.io-index)",
