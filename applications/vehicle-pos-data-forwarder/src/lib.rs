@@ -1,130 +1,217 @@
-use futures::Future;
-use mqtt311;
-use rdkafka::config::ClientConfig;
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use rumqtt::{MqttClient, MqttOptions, QoS, ReconnectOptions};
 use serde_json;
-use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::time::Duration;
-use std::{str, thread, time};
+use std::{str, thread};
 
-#[test]
-fn test_apply_fn_to_chan() {
-    let (sender, receiver) = sync_channel(10);
-    let (f_sender, f_receiver) = sync_channel(10);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time;
 
-    thread::spawn(move || {
-        apply_fn_to_chan(|x| x + 2, &receiver, &f_sender);
-    });
+    #[test]
+    fn test_apply_fn_to_chan() {
+        let (sender, receiver) = sync_channel(10);
+        let (f_sender, f_receiver) = sync_channel(10);
 
-    let val = 3;
-    sender.send(val).unwrap();
-    assert_eq!(5, f_receiver.recv().unwrap())
+        thread::spawn(move || {
+            apply_fn_to_chan(|x| x + 2, &receiver, &f_sender);
+        });
+
+        let val = 3;
+        sender.send(val).unwrap();
+        assert_eq!(5, f_receiver.recv().unwrap())
+    }
+
+    #[test]
+    fn test_covert_to_json() {
+        let (sender, receiver) = sync_channel(10);
+        let (f_sender, f_receiver) = sync_channel(10);
+
+        thread::spawn(move || {
+            convert_to_json(&receiver, &f_sender);
+        });
+
+        let json_str = String::from("{\"name\":\"Tomi\",\"age\":31,\"class\":\"rust basics\"}");
+        sender.send(json_str).unwrap();
+        let json_value = f_receiver.recv().unwrap();
+        assert_eq!("Tomi", json_value["name"].as_str().unwrap());
+        assert_eq!(31, json_value["age"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn test_mqtt_reader() {
+        // TODO This test is unstable, messages to test.mosquitto.org are not going through reliably
+        use rumqtt::{MqttClient, MqttOptions, QoS, ReconnectOptions};
+        use uuid::Uuid;
+
+        let mqtt_host = String::from("test.mosquitto.org");
+        let mqtt_port = 1883;
+        let mqtt_topic = format!("/tomi/{}", Uuid::new_v4());
+
+        let config = hsl_mqtt::MqttConfig {
+            mqtt_host,
+            mqtt_port,
+            mqtt_topic,
+        };
+
+        let (sender, receiver) = sync_channel(10);
+        let read_config = config.clone();
+        thread::spawn(move || {
+            hsl_mqtt::read_mqtt_feed(&sender, read_config);
+        });
+
+        thread::sleep(time::Duration::from_secs(3));
+
+        let reconnection_options = ReconnectOptions::Always(2);
+        let mqtt_options =
+            MqttOptions::new("hsl", config.mqtt_host.as_str(), config.mqtt_port as u16)
+                .set_keep_alive(10)
+                .set_inflight(3)
+                .set_request_channel_capacity(3)
+                .set_reconnect_opts(reconnection_options)
+                .set_clean_session(false);
+
+        let (mut m, _) = MqttClient::start(mqtt_options).unwrap();
+
+        let pub_handler = thread::spawn(move || {
+            let timeout = time::Duration::from_millis(500);
+
+            let msg = String::from("Hello from mosquitto!");
+            m.publish(config.mqtt_topic.as_str(), QoS::AtLeastOnce, false, msg)
+                .expect("First message send failed!");
+
+            thread::sleep(timeout);
+            let msg = String::from("Hello Again!");
+            m.publish(config.mqtt_topic.as_str(), QoS::AtLeastOnce, false, msg)
+                .expect("Second message send failed!");
+
+            thread::sleep(time::Duration::from_secs(10));
+        });
+
+        pub_handler.join().unwrap();
+
+        let mut expected: HashSet<String> = HashSet::new();
+        expected.insert("Hello from mosquitto!".to_string());
+        expected.insert("Hello Again!".to_string());
+
+        let mut messages: HashSet<String> = HashSet::new();
+        messages.insert(receiver.recv().unwrap());
+        messages.insert(receiver.recv().unwrap());
+
+        assert_eq!(expected, messages);
+    }
 }
 
-#[test]
-fn test_covert_to_json() {
-    let (sender, receiver) = sync_channel(10);
-    let (f_sender, f_receiver) = sync_channel(10);
+mod hsl_mqtt {
+    use super::*;
+    use mqtt311;
+    use rumqtt::{MqttClient, MqttOptions, QoS, ReconnectOptions};
 
-    thread::spawn(move || {
-        convert_to_json(&receiver, &f_sender);
-    });
+    #[derive(Debug, Clone)]
+    pub struct MqttConfig {
+        pub mqtt_host: String,
+        pub mqtt_port: u32,
+        pub mqtt_topic: String,
+    }
 
-    let json_str = String::from("{\"name\":\"Tomi\",\"age\":31,\"class\":\"rust basics\"}");
-    sender.send(json_str).unwrap();
-    let json_value = f_receiver.recv().unwrap();
-    assert_eq!("Tomi", json_value["name"].as_str().unwrap());
-    assert_eq!(31, json_value["age"].as_u64().unwrap());
+    #[derive(Debug)]
+    struct MqttPayloadError(String);
+
+    impl fmt::Display for MqttPayloadError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "There is an error: {}", self.0)
+        }
+    }
+
+    impl Error for MqttPayloadError {}
+
+    fn extract_mqtt_payload(p: mqtt311::Publish) -> Result<String, MqttPayloadError> {
+        let m = match str::from_utf8(&p.payload) {
+            Ok(m) => m,
+            Err(e) => return Result::Err(MqttPayloadError(e.to_string())),
+        };
+        Result::Ok(String::from(m))
+    }
+
+    pub fn read_mqtt_feed(sender: &SyncSender<String>, config: MqttConfig) -> () {
+        let reconnection_options = ReconnectOptions::Always(10);
+        let mqtt_options =
+            MqttOptions::new("hsl", config.mqtt_host.as_str(), config.mqtt_port as u16)
+                .set_keep_alive(10)
+                .set_inflight(3)
+                .set_request_channel_capacity(3)
+                .set_reconnect_opts(reconnection_options)
+                .set_clean_session(false);
+
+        let (mut m, notifications) = MqttClient::start(mqtt_options).unwrap();
+
+        m.subscribe(config.mqtt_topic.as_str(), QoS::AtLeastOnce)
+            .unwrap();
+
+        for msg in notifications {
+            match msg {
+                rumqtt::client::Notification::Publish(p) => {
+                    let data = extract_mqtt_payload(p).expect("Payload extract failed for message");
+                    sender.send(data).unwrap();
+                }
+                _ => println!("Skipping non Publish-message: {:?}", msg),
+            }
+        }
+    }
 }
 
-#[test]
-fn test_mqtt_reader() {
-    // TODO This test is unstable, messages to test.mosquitto.org are not going through reliably
-    use uuid::Uuid;
+mod kafka_pub {
+    use super::*;
+    use futures::Future;
+    use rdkafka::config::ClientConfig;
+    use rdkafka::producer::{FutureProducer, FutureRecord};
 
-    let mqtt_host = String::from("test.mosquitto.org");
-    let mqtt_port = 1883;
-    let mqtt_topic = format!("/tomi/{}", Uuid::new_v4());
+    #[derive(Debug, Clone)]
+    pub struct KafkaConfig {
+        pub kafka_host: String,
+        pub kafka_topic: String,
+    }
 
-    let config = MqttConfig {
-        mqtt_host,
-        mqtt_port,
-        mqtt_topic,
-    };
+    pub fn kafka_sender(receiver: &Receiver<serde_json::Value>, config: KafkaConfig) {
+        let kafka_producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &config.kafka_host)
+            .set("produce.offset.report", "true")
+            .set("message.timeout.ms", "5000")
+            .create()
+            .expect("Producer creation error");
 
-    let (sender, receiver) = sync_channel(10);
-    let read_config = config.clone();
-    thread::spawn(move || {
-        read_mqtt_feed(&sender, read_config);
-    });
+        loop {
+            let next = receiver.recv().unwrap();
+            let key = format!("{}-{}", next["route"], next["tst"]);
+            let next = next.to_string();
 
-    thread::sleep(time::Duration::from_secs(3));
-
-    let reconnection_options = ReconnectOptions::Always(2);
-    let mqtt_options = MqttOptions::new("hsl", config.mqtt_host.as_str(), config.mqtt_port as u16)
-        .set_keep_alive(10)
-        .set_inflight(3)
-        .set_request_channel_capacity(3)
-        .set_reconnect_opts(reconnection_options)
-        .set_clean_session(false);
-
-    let (mut m, _) = MqttClient::start(mqtt_options).unwrap();
-
-    let pub_handler = thread::spawn(move || {
-        let timeout = time::Duration::from_millis(500);
-
-        let msg = String::from("Hello from mosquitto!");
-        m.publish(config.mqtt_topic.as_str(), QoS::AtLeastOnce, false, msg)
-            .expect("First message send failed!");
-
-        thread::sleep(timeout);
-        let msg = String::from("Hello Again!");
-        m.publish(config.mqtt_topic.as_str(), QoS::AtLeastOnce, false, msg)
-            .expect("Second message send failed!");
-
-        thread::sleep(time::Duration::from_secs(10));
-    });
-
-    pub_handler.join().unwrap();
-
-    let mut expected: HashSet<String> = HashSet::new();
-    expected.insert("Hello from mosquitto!".to_string());
-    expected.insert("Hello Again!".to_string());
-
-    let mut messages: HashSet<String> = HashSet::new();
-    messages.insert(receiver.recv().unwrap());
-    messages.insert(receiver.recv().unwrap());
-
-    assert_eq!(expected, messages);
+            let delivery = kafka_producer.send(
+                FutureRecord::to(config.kafka_topic.as_str())
+                    .payload(next.as_bytes())
+                    .key(key.as_str()),
+                -1,
+            );
+            print!("Sent key {} to kafka... ", key);
+            match delivery.wait().unwrap() {
+                Ok((num1, num2)) => println!("delivery ok {} {}.", num1, num2),
+                Err(e) => panic!("Delivery failed to kafka: {:?}", e),
+            };
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub mqtt_config: MqttConfig,
+    pub mqtt_config: hsl_mqtt::MqttConfig,
     pub endpoint_config: EndpointConfig,
 }
 
 #[derive(Debug, Clone)]
-pub struct MqttConfig {
-    pub mqtt_host: String,
-    pub mqtt_port: u32,
-    pub mqtt_topic: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct KafkaConfig {
-    pub kafka_host: String,
-    pub kafka_topic: String,
-}
-
-#[derive(Debug, Clone)]
 pub enum EndpointConfig {
-    KafkaConfig(KafkaConfig),
+    KafkaConfig(kafka_pub::KafkaConfig),
     DebugConfig,
 }
 
@@ -162,7 +249,7 @@ impl Config {
                         None => return Err("Did not get kafka topic"),
                     };
 
-                    EndpointConfig::KafkaConfig(KafkaConfig {
+                    EndpointConfig::KafkaConfig(kafka_pub::KafkaConfig {
                         kafka_host,
                         kafka_topic,
                     })
@@ -178,7 +265,7 @@ impl Config {
             return Err("Unexpected argument after endpoint arguments.");
         }
 
-        let mqtt_config = MqttConfig {
+        let mqtt_config = hsl_mqtt::MqttConfig {
             mqtt_host,
             mqtt_port,
             mqtt_topic,
@@ -188,51 +275,6 @@ impl Config {
             mqtt_config,
             endpoint_config,
         })
-    }
-}
-
-#[derive(Debug)]
-struct MqttPayloadError(String);
-
-impl fmt::Display for MqttPayloadError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "There is an error: {}", self.0)
-    }
-}
-
-impl Error for MqttPayloadError {}
-
-fn extract_mqtt_payload(p: mqtt311::Publish) -> Result<String, MqttPayloadError> {
-    let m = match str::from_utf8(&p.payload) {
-        Ok(m) => m,
-        Err(e) => return Result::Err(MqttPayloadError(e.to_string())),
-    };
-    Result::Ok(String::from(m))
-}
-
-fn read_mqtt_feed(sender: &SyncSender<String>, config: MqttConfig) -> () {
-    let reconnection_options = ReconnectOptions::Always(10);
-    let mqtt_options = MqttOptions::new("hsl", config.mqtt_host.as_str(), config.mqtt_port as u16)
-        .set_keep_alive(10)
-        .set_inflight(3)
-        .set_request_channel_capacity(3)
-        .set_reconnect_opts(reconnection_options)
-        .set_clean_session(false);
-
-    let (mut m, notifications) = MqttClient::start(mqtt_options).unwrap();
-
-    let vehicle_postions = m
-        .subscribe(config.mqtt_topic.as_str(), QoS::AtLeastOnce)
-        .unwrap();
-
-    for msg in notifications {
-        match msg {
-            rumqtt::client::Notification::Publish(p) => {
-                let data = extract_mqtt_payload(p).expect("Payload extract failed for message");
-                sender.send(data).unwrap();
-            }
-            _ => println!("Skipping non Publish-message: {:?}", msg),
-        }
     }
 }
 
@@ -263,33 +305,6 @@ fn print_items<T: Debug>(receiver: &Receiver<T>) {
     }
 }
 
-pub fn kafka_sender(receiver: &Receiver<serde_json::Value>, config: KafkaConfig) {
-    let kafka_producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", &config.kafka_host)
-        .set("produce.offset.report", "true")
-        .set("message.timeout.ms", "5000")
-        .create()
-        .expect("Producer creation error");
-
-    loop {
-        let next = receiver.recv().unwrap();
-        let key = format!("{}-{}", next["route"], next["tst"]);
-        let next = next.to_string();
-
-        let delivery = kafka_producer.send(
-            FutureRecord::to(config.kafka_topic.as_str())
-                .payload(next.as_bytes())
-                .key(key.as_str()),
-            -1,
-        );
-        print!("Sent key {} to kafka... ", key);
-        match delivery.wait().unwrap() {
-            Ok((num1, num2)) => println!("delivery ok {} {}.", num1, num2),
-            Err(e) => panic!("Delivery failed to kafka: {:?}", e),
-        };
-    }
-}
-
 pub fn run(config: Config) {
     let (raw_data_sender, raw_data_receiver) = sync_channel(100);
     let (json_data_sender, json_data_receiver) = sync_channel(100);
@@ -297,7 +312,7 @@ pub fn run(config: Config) {
 
     let mqtt_config = config.clone().mqtt_config;
     thread::spawn(move || {
-        read_mqtt_feed(&raw_data_sender, mqtt_config);
+        hsl_mqtt::read_mqtt_feed(&raw_data_sender, mqtt_config);
     });
 
     thread::spawn(move || {
@@ -315,7 +330,7 @@ pub fn run(config: Config) {
     match config.endpoint_config {
         EndpointConfig::DebugConfig => print_items(&transformer_receiver),
         EndpointConfig::KafkaConfig(kafka_config) => {
-            kafka_sender(&transformer_receiver, kafka_config)
+            kafka_pub::kafka_sender(&transformer_receiver, kafka_config)
         }
     }
 }
