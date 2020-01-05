@@ -5,5 +5,5 @@ variable "region" {
  
 variable "namespace" {
   type    = string
-  default = "ade-dev-westeur"
+  default = "hsl-dev-westeur"
 }
