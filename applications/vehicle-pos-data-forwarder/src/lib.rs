@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::fmt::Debug;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::{str, thread};
+use std::{env, str, thread};
 
 #[cfg(test)]
 mod tests {
@@ -203,6 +203,81 @@ mod kafka_pub {
     }
 }
 
+mod eventhub_pub {
+    use super::*;
+    use futures::Future;
+    use rdkafka::config::ClientConfig;
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    use regex::Regex;
+
+    #[derive(Debug, Clone)]
+    pub struct EventHubConfig {
+        pub connection_str: String,
+        pub eventhub_name: String,
+        pub ca_cert_path: String,
+    }
+
+    pub fn eventhub_sender(receiver: &Receiver<serde_json::Value>, config: EventHubConfig) {
+        // Credits to rtyler, see: https://brokenco.de/2019/04/04/azure-eventhubs-rust.html
+        let connection_str = config.connection_str.as_str();
+        let re = Regex::new(r"Endpoint=sb://(?P<host>.*)/;(.*)")
+            .expect("Error parsing Azure EventHub conection string");
+        let caps = re.captures(connection_str).unwrap();
+
+        let mut brokers = String::from(&caps["host"]);
+        brokers.push_str(":9093");
+
+        println!("Sending messages to: {}", &brokers);
+        println!("Sending messages to eventhub: {}", &config.eventhub_name);
+
+        let kafka_producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &brokers)
+            .set("produce.offset.report", "true")
+            .set("message.timeout.ms", "5000")
+            .set("security.protocol", "SASL_SSL")
+            /*
+             * The following setting -must- be set for librdkafka, but doesn't seem to do anything
+             * worthwhile,. Since we're not relying on kerberos, let's just give it some junk :)
+             */
+            .set("sasl.kerberos.kinit.cmd", "echo 'who wants kerberos?!'")
+            /*
+             * Another unused setting which is required to be present
+             */
+            .set("sasl.kerberos.keytab", "keytab")
+            .set("sasl.mechanisms", "PLAIN")
+            /*
+             * The username that Azure Event Hubs uses for Kafka is really this
+             */
+            .set("sasl.username", "$ConnectionString")
+            /*
+             * NOTE: Depending on your system, you may need to change this to adifferent location
+             */
+            .set("ssl.ca.location", config.ca_cert_path.as_str())
+            .set("sasl.password", &connection_str)
+            .set("client.id", "rust_hsl_producer")
+            .create()
+            .expect("Producer creation error");
+
+        loop {
+            let next = receiver.recv().unwrap();
+            let key = format!("{}-{}", next["route"], next["tst"]);
+            let next = next.to_string();
+
+            let delivery = kafka_producer.send(
+                FutureRecord::to(config.eventhub_name.as_str())
+                    .payload(next.as_bytes())
+                    .key(key.as_str()),
+                -1,
+            );
+            print!("Sent key {} to Azure Event Hub... ", key);
+            match delivery.wait().unwrap() {
+                Ok((num1, num2)) => println!("delivery ok {} {}.", num1, num2),
+                Err(e) => panic!("Delivery failed to Azure Event Hub: {:?}", e),
+            };
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub mqtt_config: hsl_mqtt::MqttConfig,
@@ -212,6 +287,7 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub enum EndpointConfig {
     KafkaConfig(kafka_pub::KafkaConfig),
+    EventHubConfig(eventhub_pub::EventHubConfig),
     DebugConfig,
 }
 
@@ -219,6 +295,18 @@ impl Config {
     pub fn new(mut args: std::env::Args) -> Result<Config, &'static str> {
         let mqtt_host = String::from("mqtt.hsl.fi");
         let mqtt_port = 1883;
+
+        let default_ca_cert_path = String::from("/usr/lib/ssl/certs/ca-certificates.crt");
+        let ca_cert_path = match env::var("HSL_CA_CERT_PATH") {
+            Ok(cert_path) => {
+                println!("Using ca_cert path from environment variable HSL_CA_CERT_PATH={}", cert_path);
+                cert_path
+            }
+            Err(_) => {
+                println!("Using default ca_cert_path={}", default_ca_cert_path);
+                default_ca_cert_path
+            }
+        };
 
         args.next(); // skip the name of the program
 
@@ -253,11 +341,32 @@ impl Config {
                         kafka_host,
                         kafka_topic,
                     })
+                } else if arg == "eventhub" {
+
+                    let connection_str = match env::var("HSL_EVENTHUB_CONN") {
+                        Ok(connection_str) => {
+                            connection_str
+                        }
+                        Err(_) => {
+                            return Err("Did not find environment variable HSL_EVENTHUB_CONN which is required!")
+                        }
+                    };
+
+                    let eventhub_name = match args.next() {
+                        Some(arg) => arg,
+                        None => return Err("Did not get eventhub name"),
+                    };
+
+                    EndpointConfig::EventHubConfig(eventhub_pub::EventHubConfig {
+                        connection_str,
+                        eventhub_name,
+                        ca_cert_path,
+                    })
                 } else {
-                    return Err("Incorrect endpoint type, expected kafka or debug");
+                    return Err("Incorrect endpoint type, expected kafka, eventhub or debug");
                 }
             }
-            None => return Err("Did not get endpoint type, expected kafka or debug"),
+            None => return Err("Did not get endpoint type, expected kafka, eventhub or debug"),
         };
 
         let next_arg = args.next();
@@ -331,6 +440,9 @@ pub fn run(config: Config) {
         EndpointConfig::DebugConfig => print_items(&transformer_receiver),
         EndpointConfig::KafkaConfig(kafka_config) => {
             kafka_pub::kafka_sender(&transformer_receiver, kafka_config)
+        },
+        EndpointConfig::EventHubConfig(eventhub_config) => {
+            eventhub_pub::eventhub_sender(&transformer_receiver, eventhub_config)
         }
     }
 }
