@@ -109,13 +109,11 @@ resource "azurerm_stream_analytics_output_blob" "sas_job_output" {
   storage_account_name      = azurerm_storage_account.storage_account.name
   storage_account_key       = azurerm_storage_account.storage_account.primary_access_key
   storage_container_name    = azurerm_storage_container.blob_storage.name
-  path_pattern              = "{date}/{time}"
+  path_pattern              = "avro/{date}/{time}"
   date_format               = "yyyy-MM-dd"
   time_format               = "HH"
 
   serialization {
-    type            = "Json"
-    encoding        = "UTF8"
-    format          = "Array"
+    type            = "Avro"
   }
 }
