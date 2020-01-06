@@ -89,7 +89,7 @@ QUERY
 resource "azurerm_stream_analytics_stream_input_eventhub" "sas_job_input" {
   name                         = "hsl-hub-input"
   stream_analytics_job_name    = azurerm_stream_analytics_job.sas_job.name
-  resource_group_name          = azurerm_stream_analytics_job.sas_job.resource_group_name
+  resource_group_name          = azurerm_resource_group.default.name
   eventhub_consumer_group_name = azurerm_eventhub_consumer_group.eventhub_consumergroup.name
   eventhub_name                = azurerm_eventhub.eventhub.name
   servicebus_namespace         = azurerm_eventhub_namespace.eventhub_namespace.name
@@ -105,7 +105,7 @@ resource "azurerm_stream_analytics_stream_input_eventhub" "sas_job_input" {
 resource "azurerm_stream_analytics_output_blob" "sas_job_output" {
   name                      = "hsl-blob-output"
   stream_analytics_job_name = azurerm_stream_analytics_job.sas_job.name
-  resource_group_name       = azurerm_stream_analytics_job.sas_job.resource_group_name
+  resource_group_name       = azurerm_resource_group.default.name
   storage_account_name      = azurerm_storage_account.storage_account.name
   storage_account_key       = azurerm_storage_account.storage_account.primary_access_key
   storage_container_name    = azurerm_storage_container.blob_storage.name
