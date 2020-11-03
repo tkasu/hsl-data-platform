@@ -28,6 +28,14 @@ cargo run dev kafka localhost:9092 hsl
 docker exec -it kafka_kafka_1  kafka-console-consumer.sh --topic hsl --bootstrap-server localhost:9093
 ```
 
+# Launch Stream runner
+
+Run e.g. VehicleSpeedAnalysisStream in applications/vehicle-pos-kafka-streams
+
+# Read average speed for each vehicle
+
+docker exec -it kafka_kafka_1  kafka-console-consumer.sh --topic hsl-speed-stats --bootstrap-server localhost:9093 --property print.key=true --property value.deserializer=org.apache.kafka.common.serialization.DoubleDeserializer
+
 # Destroy kafka
 
 ```
