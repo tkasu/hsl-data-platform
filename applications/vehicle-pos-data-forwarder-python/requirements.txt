@@ -1,0 +1,2 @@
+confluent-kafka==1.5
+paho-mqtt==1.5
