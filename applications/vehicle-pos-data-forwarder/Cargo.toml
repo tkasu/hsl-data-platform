@@ -14,4 +14,4 @@ uuid = { version = "0.8", features = ["v4"] }
 rdkafka-sys = { version = "=1.2.2", default-features = false }
 rdkafka = { version = "0.22.0", features = ["ssl", "sasl"] }
 futures = "0.1.21"
-regex = "1.3.1"
+regex = "1.5.5"
